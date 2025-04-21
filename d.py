@@ -279,6 +279,7 @@ class WSNMainWindow(QMainWindow):
         self.setup_nodes()
         self.cycle = 0
         self.max_cycles = 5
+        self.cycle_data = []  # Store data per cycle for CSV
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -353,6 +354,7 @@ class WSNMainWindow(QMainWindow):
         self.start_button.setEnabled(False)
         self.status_label.setText("Simulation Running...")
         self.cycle = 0
+        self.cycle_data = []  # Reset cycle data
         self.timer.start(2000)
 
     def run_cycle(self):
@@ -366,6 +368,14 @@ class WSNMainWindow(QMainWindow):
 
         active_nodes = 0
         self.status_label.setText(f"Cycle {self.cycle}/{self.max_cycles}")
+        cycle_data_point = {
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'temperature': 'N/A',
+            'moisture': 'N/A',
+            'humidity': 'N/A',
+            'light': 'N/A',
+            'ph': 'N/A'
+        }
         
         for node in self.nodes:
             if not node.active:
@@ -376,9 +386,13 @@ class WSNMainWindow(QMainWindow):
                 if node.transmit_data(self.base_station):
                     self.base_station.receive_data(node.id, data, node.duty_cycle)
                     self.canvas.add_transmission_and_data(node.x, node.y, node.id, data, node.battery, node.data_type, node.duty_cycle)
+                    data_type = list(data.keys())[0]
+                    value = list(data.values())[0]
+                    cycle_data_point[data_type] = f"{value:.1f}"
                 else:
                     self.status_label.setText(f"Node {node.id} failed to transmit")
         
+        self.cycle_data.append(cycle_data_point)
         self.canvas.update()
         
         if active_nodes == 0:
@@ -390,12 +404,16 @@ class WSNMainWindow(QMainWindow):
     def show_summary(self):
         with open('wsn_data.csv', 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
-            writer.writerow(['NodeID', 'Timestamp', 'DataType', 'Value', 'Unit', 'DutyCycle'])
-            for data in self.base_station.collected_data:
-                data_type = list(data['data'].keys())[0]
-                value = list(data['data'].values())[0]
-                unit = '%' if data_type in ['moisture', 'humidity'] else 'µmol/m²/s' if data_type == 'light' else '°C' if data_type == 'temperature' else ''
-                writer.writerow([data['node_id'], data['timestamp'], data_type.capitalize(), f"{value:.1f}", unit, f"{data['duty_cycle']*100:.0f}%"])
+            writer.writerow(['Timestamp', 'Temperature', 'Moisture', 'Humidity', 'Light', 'Ph'])
+            for data_point in self.cycle_data:
+                writer.writerow([
+                    data_point['timestamp'],
+                    data_point['temperature'],
+                    data_point['moisture'],
+                    data_point['humidity'],
+                    data_point['light'],
+                    data_point['ph']
+                ])
 
         dialog = QDialog(self)
         dialog.setWindowTitle("Simulation Summary")
