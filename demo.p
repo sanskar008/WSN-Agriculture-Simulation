@@ -9,24 +9,57 @@ from PyQt6.QtGui import (QPainter, QColor, QPen, QFont, QImage, QBrush, QRadialG
                         QLinearGradient, QPainterPath, QPolygonF)
 from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QPointF, QRectF
 
-# Sensor Node class
+# Sensor Node class with LPWAN and adaptive duty cycle
 class SensorNode:
-    def __init__(self, id, x, y, data_type, battery=100.0, sensing_range=10.0, comm_range=50.0):
+    def __init__(self, id, x, y, data_type, battery=100.0, sensing_range=10.0, comm_range=1000.0):
         self.id = id
         self.x = x
         self.y = y
         self.battery = battery
         self.sensing_range = sensing_range
-        self.comm_range = comm_range
+        self.comm_range = comm_range  # Increased for LPWAN
         self.active = True
-        self.data_type = data_type  # 'moisture', 'temperature', 'humidity', 'light', 'ph'
+        self.data_type = data_type
         self.data = {self.data_type: 0.0}
-        self.energy_per_sense = 0.05
-        self.energy_per_transmit = 0.1
+        self.energy_per_sense = 0.02  # Reduced for LPWAN
+        self.energy_per_transmit = 0.05  # Reduced for LPWAN
+        self.duty_cycle = 1.0  # Percentage of time active (1.0 = always active)
+        self.sleep_time = 0  # Cycles to sleep
+        self.last_value = None  # For data criticality
+        self.critical_thresholds = {
+            'moisture': (30, 70),  # Critical if <30% or >70%
+            'temperature': (20, 30),  # Critical if <20°C or >30°C
+            'humidity': (30, 70),  # Critical if <30% or >70%
+            'light': (200, 800),  # Critical if <200 or >800 µmol/m²/s
+            'ph': (6.0, 7.0)  # Critical if <6.0 or >7.0
+        }
+
+    def update_duty_cycle(self):
+        # Adjust duty cycle based on battery and data criticality
+        if self.battery <= 0:
+            self.active = False
+            self.duty_cycle = 0.0
+            return
+        # Battery-based adjustment
+        if self.battery < 20:
+            self.duty_cycle = 0.2  # Low battery: sense/transmit less often
+        elif self.battery < 50:
+            self.duty_cycle = 0.5
+        else:
+            self.duty_cycle = 1.0
+        # Data criticality adjustment
+        if self.last_value is not None:
+            low, high = self.critical_thresholds[self.data_type]
+            if self.last_value < low or self.last_value > high:
+                self.duty_cycle = min(self.duty_cycle * 2, 1.0)  # Increase frequency for critical data
 
     def sense_environment(self):
-        if not self.active or self.battery <= 0:
-            self.active = False
+        if not self.active or self.battery <= 0 or self.sleep_time > 0:
+            self.active = False if self.battery <= 0 else self.active
+            self.sleep_time -= 1 if self.sleep_time > 0 else 0
+            return None
+        if random.random() > self.duty_cycle:
+            self.sleep_time = 1  # Skip this cycle
             return None
         if self.data_type == 'moisture':
             self.data['moisture'] = random.uniform(20, 80)
@@ -38,14 +71,16 @@ class SensorNode:
             self.data['light'] = random.uniform(100, 1000)
         elif self.data_type == 'ph':
             self.data['ph'] = random.uniform(5.5, 7.5)
+        self.last_value = list(self.data.values())[0]
         self.battery -= self.energy_per_sense
+        self.update_duty_cycle()
         if self.battery <= 0:
             self.active = False
         return self.data
 
     def transmit_data(self, base_station):
-        if not self.active or self.battery <= 0:
-            self.active = False
+        if not self.active or self.battery <= 0 or self.sleep_time > 0:
+            self.active = False if self.battery <= 0 else self.active
             return False
         distance = math.sqrt((self.x - base_station.x)**2 + (self.y - base_station.y)**2)
         if distance <= self.comm_range:
@@ -62,12 +97,13 @@ class BaseStation:
         self.y = y
         self.collected_data = []
 
-    def receive_data(self, node_id, data):
+    def receive_data(self, node_id, data, duty_cycle):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.collected_data.append({
+        self.colibrated_data.append({
             'node_id': node_id,
             'timestamp': timestamp,
-            'data': data
+            'data': data,
+            'duty_cycle': duty_cycle
         })
 
 # Field Canvas for visualizing nodes, base station, transmissions, and data
@@ -77,24 +113,20 @@ class FieldCanvas(QWidget):
         self.nodes = nodes
         self.base_station = base_station
         self.field_width, self.field_height = field_size
-        self.transmissions = []  # List of (node_x, node_y, opacity) for active transmissions
-        self.data_labels = []  # List of (node_x, node_y, text, opacity) for data display
+        self.transmissions = []
+        self.data_labels = []
         self.setFixedSize(500, 500)
-        # Load background image
-        self.background_image = QImage("field2.jpg")
-        # Node fade-in animation
-        self._node_opacity = 0  # Internal attribute
+        self.background_image = QImage("field2.png")
+        self._node_opacity = 0
         self.fade_anim = QPropertyAnimation(self, b"node_opacity")
         self.fade_anim.setDuration(1000)
         self.fade_anim.setStartValue(0)
         self.fade_anim.setEndValue(255)
         self.fade_anim.start()
-        # Base station pulse
         self.base_pulse = 0
         self.pulse_timer = QTimer()
         self.pulse_timer.timeout.connect(self.update_base_pulse)
         self.pulse_timer.start(50)
-        # Transmission and label timer
         self.clear_timer = QTimer()
         self.clear_timer.timeout.connect(self.clear_transmissions_and_labels)
 
@@ -115,7 +147,7 @@ class FieldCanvas(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # Draw background with vignette
+        # Draw background
         if not self.background_image.isNull():
             painter.drawImage(self.rect(), self.background_image.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         else:
@@ -123,13 +155,11 @@ class FieldCanvas(QWidget):
             gradient.setColorAt(0, QColor(0, 100, 0))
             gradient.setColorAt(1, QColor(0, 50, 0))
             painter.fillRect(self.rect(), gradient)
-        # Vignette overlay
         vignette = QRadialGradient(250, 250, 300)
         vignette.setColorAt(0, QColor(0, 0, 0, 0))
         vignette.setColorAt(1, QColor(0, 0, 0, 100))
         painter.fillRect(self.rect(), vignette)
 
-        # Scale coordinates
         scale_x = self.width() / self.field_width
         scale_y = self.height() / self.field_height
 
@@ -145,7 +175,7 @@ class FieldCanvas(QWidget):
             painter.setPen(QPen(QBrush(gradient), 3, Qt.PenStyle.DashLine))
             painter.drawLine(int(start_x), int(start_y), int(end_x), int(end_y))
 
-        # Draw base station (pulsing hexagon)
+        # Draw base station
         bs_x = self.base_station.x * scale_x
         bs_y = self.base_station.y * scale_y
         hexagon = QPolygonF()
@@ -160,7 +190,6 @@ class FieldCanvas(QWidget):
         painter.setBrush(gradient)
         painter.setPen(QPen(QColor(0, 255, 255, 200), 2))
         painter.drawPolygon(hexagon)
-        # Glow effect
         glow = QRadialGradient(bs_x, bs_y, 20)
         glow.setColorAt(0, QColor(0, 255, 255, 100))
         glow.setColorAt(1, QColor(0, 255, 255, 0))
@@ -172,22 +201,20 @@ class FieldCanvas(QWidget):
         for node in self.nodes:
             x = node.x * scale_x
             y = node.y * scale_y
-            # Color by data type
             colors = {
-                'moisture': (0, 150, 255),    # Blue
-                'temperature': (255, 100, 0), # Orange
-                'humidity': (0, 200, 0),      # Green
-                'light': (255, 255, 0),       # Yellow
-                'ph': (200, 0, 200)           # Purple
+                'moisture': (0, 150, 255),
+                'temperature': (255, 100, 0),
+                'humidity': (0, 200, 0),
+                'light': (255, 255, 0),
+                'ph': (200, 0, 200)
             }
-            color = colors[node.data_type] if node.active and node.battery > 0 else (100, 100, 100)
+            color = colors[node.data_type] if node.active and node.battery > 0 and node.sleep_time == 0 else (100, 100, 100)
             gradient = QRadialGradient(x, y, 8)
             gradient.setColorAt(0, QColor(*color, self._node_opacity))
             gradient.setColorAt(1, QColor(*color, int(self._node_opacity * 0.5)))
             painter.setBrush(gradient)
             painter.setPen(QPen(QColor(255, 255, 255, self._node_opacity), 1))
             painter.drawEllipse(QPointF(x, y), 8, 8)
-            # Shadow
             shadow = QRadialGradient(x + 2, y + 2, 10)
             shadow.setColorAt(0, QColor(0, 0, 0, 50))
             shadow.setColorAt(1, QColor(0, 0, 0, 0))
@@ -195,25 +222,23 @@ class FieldCanvas(QWidget):
             painter.setPen(Qt.PenStyle.NoPen)
             painter.drawEllipse(QPointF(x + 2, y + 2), 10, 10)
 
-        # Draw data labels to the right of nodes
+        # Draw data labels
         painter.setFont(QFont("Roboto", 9, QFont.Weight.Bold))
         for x, y, text, opacity in self.data_labels:
             label_x = x * scale_x + 15
             label_y = y * scale_y - 30
-            # Glassmorphism background
             path = QPainterPath()
             rect = QRectF(label_x - 5, label_y - 35, 120, 70)
             path.addRoundedRect(rect, 10, 10)
             painter.setBrush(QBrush(QColor(255, 255, 255, 80)))
             painter.setPen(QPen(QColor(255, 255, 255, 150), 1))
             painter.drawPath(path)
-            # Draw text
             painter.setPen(QPen(QColor(255, 255, 255, opacity)))
             painter.drawText(rect.adjusted(8, 8, -8, -8), Qt.TextFlag.TextWordWrap, text)
 
         painter.end()
 
-    def add_transmission_and_data(self, node_x, node_y, node_id, data, battery, data_type):
+    def add_transmission_and_data(self, node_x, node_y, node_id, data, battery, data_type, duty_cycle):
         self.transmissions.append((node_x, node_y, 255))
         value = list(data.values())[0]
         unit = '%' if data_type in ['moisture', 'humidity'] else 'µmol/m²/s' if data_type == 'light' else '°C' if data_type == 'temperature' else ''
@@ -227,7 +252,8 @@ class FieldCanvas(QWidget):
         text = (
             f"ID: {node_id}\n"
             f"{icons[data_type]}{data_type.capitalize()}: {value:.1f}{unit}\n"
-            f"🔋 Battery: {battery:.1f}%"
+            f"🔋 Battery: {battery:.1f}%\n"
+            f"🔄 Duty Cycle: {duty_cycle*100:.0f}%"
         )
         self.data_labels.append((node_x, node_y, text, 255))
         self.update()
@@ -243,11 +269,10 @@ class FieldCanvas(QWidget):
 class WSNMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("WSN Agriculture Simulator")
+        self.setWindowTitle("WSN Agriculture Simulator with LPWAN")
         self.setFixedSize(600, 600)
         self.setStyleSheet("background-color: #1a1a1a;")
 
-        # Initialize simulator
         self.field_size = (100, 100)
         self.nodes = []
         self.base_station = BaseStation(self.field_size[0] / 2, self.field_size[1] / 2)
@@ -255,18 +280,15 @@ class WSNMainWindow(QMainWindow):
         self.cycle = 0
         self.max_cycles = 5
 
-        # GUI setup
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
         layout.setContentsMargins(20, 20, 20, 20)
 
-        # Canvas
         self.canvas = FieldCanvas(self.nodes, self.base_station, self.field_size)
         self.canvas.setStyleSheet("border-radius: 10px; overflow: hidden;")
         layout.addWidget(self.canvas)
 
-        # Start button
         self.start_button = QPushButton("Start Simulation")
         self.start_button.setStyleSheet("""
             QPushButton {
@@ -289,7 +311,6 @@ class WSNMainWindow(QMainWindow):
         self.start_button.clicked.connect(self.start_simulation)
         layout.addWidget(self.start_button)
 
-        # Status label
         self.status_label = QLabel("Click 'Start Simulation' to begin")
         self.status_label.setStyleSheet("""
             color: #ffffff;
@@ -302,7 +323,6 @@ class WSNMainWindow(QMainWindow):
         """)
         layout.addWidget(self.status_label)
 
-        # Timer for simulation cycles
         self.timer = QTimer()
         self.timer.timeout.connect(self.run_cycle)
 
@@ -325,7 +345,7 @@ class WSNMainWindow(QMainWindow):
                 x=x,
                 y=y,
                 data_type=config['data_type'],
-                comm_range=50.0
+                comm_range=1000.0  # LPWAN range
             )
             self.nodes.append(node)
 
@@ -354,8 +374,8 @@ class WSNMainWindow(QMainWindow):
             if data:
                 active_nodes += 1
                 if node.transmit_data(self.base_station):
-                    self.base_station.receive_data(node.id, data)
-                    self.canvas.add_transmission_and_data(node.x, node.y, node.id, data, node.battery, node.data_type)
+                    self.base_station.receive_data(node.id, data, node.duty_cycle)
+                    self.canvas.add_transmission_and_data(node.x, node.y, node.id, data, node.battery, node.data_type, node.duty_cycle)
                 else:
                     self.status_label.setText(f"Node {node.id} failed to transmit")
         
@@ -368,17 +388,15 @@ class WSNMainWindow(QMainWindow):
             self.show_summary()
 
     def show_summary(self):
-        # Generate CSV file
         with open('wsn_data.csv', 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
-            writer.writerow(['NodeID', 'Timestamp', 'DataType', 'Value', 'Unit'])
+            writer.writerow(['NodeID', 'Timestamp', 'DataType', 'Value', 'Unit', 'DutyCycle'])
             for data in self.base_station.collected_data:
                 data_type = list(data['data'].keys())[0]
                 value = list(data['data'].values())[0]
                 unit = '%' if data_type in ['moisture', 'humidity'] else 'µmol/m²/s' if data_type == 'light' else '°C' if data_type == 'temperature' else ''
-                writer.writerow([data['node_id'], data['timestamp'], data_type.capitalize(), f"{value:.1f}", unit])
+                writer.writerow([data['node_id'], data['timestamp'], data_type.capitalize(), f"{value:.1f}", unit, f"{data['duty_cycle']*100:.0f}%"])
 
-        # Show summary dialog
         dialog = QDialog(self)
         dialog.setWindowTitle("Simulation Summary")
         dialog.setFixedSize(400, 300)
@@ -413,6 +431,7 @@ class WSNMainWindow(QMainWindow):
             summary_text += (
                 f"Node {data['node_id']} at {data['timestamp']}:\n"
                 f"  {data_type.capitalize()}: {value:.1f}{unit}\n"
+                f"  Duty Cycle: {data['duty_cycle']*100:.0f}%\n"
             )
         text.setText(summary_text)
         layout.addWidget(text)
@@ -432,17 +451,14 @@ class WSNMainWindow(QMainWindow):
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #00d4fb, stop:1 #00a3d0);
             }
         """)
-        buttons.accepted.connect(dialog.accept)
-        layout.addWidget(buttons)
+        buttons.accepted.connect(dialog        layout.addWidget(buttons)
 
         dialog.setLayout(layout)
         dialog.exec()
 
-# Run the application
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     window = WSNMainWindow()
     window.show()
     sys.exit(app.exec())
-
